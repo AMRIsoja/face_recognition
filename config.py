@@ -14,7 +14,7 @@ IMAGES_PATH = os.path.join(BASE_DIR, "images")
 # The minimum confidence level for a face match (e.g., 0.6 means 60% confidence)
 # This can be adjusted based on your needs. A lower value is more permissive,
 # a higher value is more strict.
-FACE_MATCH_THRESHOLD = 0.6
+FACE_MATCH_THRESHOLD = 0.3
 
 # The time in seconds to wait before logging attendance for the same user again.
 # This prevents logging a single person multiple times in a short window.

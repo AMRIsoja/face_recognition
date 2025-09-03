@@ -1,115 +1,172 @@
 import cv2
 import face_recognition
 import numpy as np
-import time
 import os
+import time
+from datetime import datetime
 from database_module import DatabaseManager
-from config import DATABASE_PATH, FACE_MATCH_THRESHOLD, ATTENDANCE_LOGGING_INTERVAL
+from config import DATABASE_PATH
 
-# Initialize the DatabaseManager with the path from the config file
+# Initialize the DatabaseManager
 db_manager = DatabaseManager(db_path=DATABASE_PATH)
 
-# --- 1. Load Known Face Encodings from the Database ---
 def load_known_faces():
     """
-    Loads all user data (including names and face encodings) from the database.
-    This function should be called once at the start of the program.
+    Loads all known face encodings and names from the database.
+    
+    Returns:
+        list, list, list: A tuple containing lists of known face encodings,
+                         names, and user IDs.
     """
     print("Loading known faces from the database...")
     users = db_manager.get_all_users()
-    known_face_encodings = [user['face_encoding'] for user in users]
+    
+    known_face_encodings = [user['encoding'] for user in users]
     known_face_names = [user['name'] for user in users]
-    known_face_user_ids = [user['user_id'] for user in users]
+    known_face_user_ids = [user['id'] for user in users]
     
     print(f"Loaded {len(known_face_encodings)} known faces.")
     return known_face_encodings, known_face_names, known_face_user_ids
 
-# --- 2. Main Face Recognition Loop ---
+def mark_attendance(user_id):
+    """
+    Marks the attendance for a given user ID.
+    
+    Args:
+        user_id (str): The ID of the user to mark attendance for.
+    """
+    # Check if a record exists for today
+    today = datetime.now().strftime("%Y-%m-%d")
+    record = db_manager.get_attendance_record(user_id, today)
+    
+    if record:
+        print(f"Attendance already marked for user {user_id} today.")
+        return True # Return True to indicate attendance was handled
+    else:
+        # Mark attendance for the user
+        db_manager.add_attendance_record(user_id, today)
+        print(f"Attendance marked for user {user_id}.")
+        return True # Return True to indicate attendance was handled
+
 def run_face_recognition():
     """
-    Main function to run the video stream and perform face recognition.
-    It captures video, finds faces, compares them to known faces, and logs attendance.
+    Main function to run the face recognition attendance system.
     """
-    # Load known faces from the database
+    # Load known faces and their IDs
     known_face_encodings, known_face_names, known_face_user_ids = load_known_faces()
     
-    # Initialize a dictionary to store the last time attendance was logged for each user
-    last_attendance_log = {}
-
-    # Open a connection to the webcam (0 is usually the default webcam)
-    video_capture = cv2.VideoCapture(0)
-
-    if not video_capture.isOpened():
-        print("Error: Could not open video stream. Make sure a webcam is connected and not in use by another application.")
+    if not known_face_encodings:
+        print("No registered faces found. Please register a user first using user_registration.py")
         return
 
-    print("\nStarting video stream for face recognition. Press 'q' to quit.")
+    # Initialize video capture
+    video_capture = cv2.VideoCapture(0)
+    try:
+        if not video_capture.isOpened():
+            print("Error: Could not open video stream. Make sure a webcam is connected.")
+            return
 
-    while True:
-        # Capture a single frame of video
-        ret, frame = video_capture.read()
-        if not ret:
-            print("Error: Failed to read from video stream.")
-            break
+        print("\n--- Face Recognition Attendance System ---")
+        print("Press 'q' to quit.")
+        print("Press 'm' for manual attendance entry.")
 
-        # Convert the image from BGR color (OpenCV) to RGB color (face_recognition)
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        # Variables for tracking attendance status and timeout
+        last_detected_time = {} # Stores the last time a face was detected for each user
+        detection_threshold = 5 # seconds
+        
+        start_time = time.time()
+        face_detected_after_start = False
 
-        # Find all the faces and face encodings in the current frame
-        face_locations = face_recognition.face_locations(rgb_frame)
-        face_encodings = face_recognition.face_encodings(rgb_frame, face_locations)
+        while True:
+            ret, frame = video_capture.read()
+            if not ret or frame is None:
+                print("Error: Failed to read from video stream.")
+                break
 
-        # Loop through each face found in the frame
-        for face_encoding, face_location in zip(face_encodings, face_locations):
-            # Compare the found face with the known faces
-            # The 'face_recognition.compare_faces' function returns a list of True/False values
-            # indicating a match for each known face.
-            matches = face_recognition.compare_faces(known_face_encodings, face_encoding, tolerance=FACE_MATCH_THRESHOLD)
-            name = "Unknown"
-            user_id = "N/A"
-
-            # Use the known face with the smallest distance to the new face
-            face_distances = face_recognition.face_distance(known_face_encodings, face_encoding)
+            # Ensure frame is in the correct format
+            if frame.dtype != np.uint8:
+                frame = frame.astype(np.uint8)
+            if len(frame.shape) == 2:  # grayscale, convert to BGR
+                frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
             
-            # Find the index of the best match
-            best_match_index = np.argmin(face_distances)
+            # Check for 120-second timeout if no face has been detected yet
+            if not face_detected_after_start and (time.time() - start_time) > 120:
+                print("\nTimeout: No face detected for 120 seconds. Terminating.")
+                break
+
+            # Convert the image from BGR color to RGB color
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+            # Find all the faces and face encodings in the current frame
+            face_locations = face_recognition.face_locations(rgb_frame)
             
-            # If a match is found and the distance is within the tolerance
-            if matches[best_match_index] and face_distances[best_match_index] <= FACE_MATCH_THRESHOLD:
-                name = known_face_names[best_match_index]
-                user_id = known_face_user_ids[best_match_index]
+            if face_locations:
+                face_detected_after_start = True
+            
+            face_encodings = face_recognition.face_encodings(rgb_frame, face_locations)
+
+            for (top, right, bottom, left), face_encoding in zip(face_locations, face_encodings):
+                # See if the face is a match for the known face(s)
+                matches = face_recognition.compare_faces(known_face_encodings, face_encoding, tolerance=0.5)
+
+                name = "Unknown"
+                user_id = None
+
+                # Find the best match
+                face_distances = face_recognition.face_distance(known_face_encodings, face_encoding)
+                best_match_index = np.argmin(face_distances)
                 
-                # Check if enough time has passed since the last log for this user
-                current_time = time.time()
-                if (user_id not in last_attendance_log or 
-                    (current_time - last_attendance_log[user_id]) > ATTENDANCE_LOGGING_INTERVAL):
+                if matches[best_match_index] and face_distances[best_match_index] < 0.5:
+                    user_id = known_face_user_ids[best_match_index]
+                    name = known_face_names[best_match_index]
                     
-                    # Log attendance in the database
-                    if db_manager.log_attendance(user_id):
-                        last_attendance_log[user_id] = current_time # Update the last log time
+                    current_time = datetime.now()
                     
-            # Draw a box around the face
-            top, right, bottom, left = face_location
-            cv2.rectangle(frame, (left, top), (right, bottom), (0, 255, 0), 2)
+                    # Check if enough time has passed since the last detection for this user
+                    if (user_id not in last_detected_time or 
+                        (current_time - last_detected_time[user_id]).total_seconds() > detection_threshold):
+                        
+                        if mark_attendance(user_id):
+                            print("Attendance marked. Exiting application...")
+                            video_capture.release()
+                            cv2.destroyAllWindows()
+                            return
 
-            # Draw a label with a name below the face
-            cv2.rectangle(frame, (left, bottom - 35), (right, bottom), (0, 255, 0), cv2.FILLED)
-            font = cv2.FONT_HERSHEY_DUPLEX
-            cv2.putText(frame, name, (left + 6, bottom - 6), font, 1.0, (0, 0, 0), 1)
+                # Draw a box around the face
+                cv2.rectangle(frame, (left, top), (right, bottom), (0, 0, 255), 2)
 
-        # Display the resulting image
-        cv2.imshow('Smart Attendance System', frame)
+                # Draw a label with a name below the face
+                cv2.rectangle(frame, (left, bottom - 35), (right, bottom), (0, 0, 255), cv2.FILLED)
+                font = cv2.FONT_HERSHEY_DUPLEX
+                cv2.putText(frame, name, (left + 6, bottom - 6), font, 1.0, (255, 255, 255), 1)
 
-        # Break the loop on 'q' key press
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
+            # Display the resulting image
+            cv2.imshow('Face Recognition', frame)
 
-    # Release the webcam and close all windows
-    video_capture.release()
-    cv2.destroyAllWindows()
-    print("\nVideo stream stopped.")
-
-# This block ensures the face recognition loop runs when the script is executed
+            # Check for key presses
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                break
+            elif key == ord('m'):
+                print("\n--- Manual Attendance ---")
+                user_id = input("Enter User ID for manual attendance: ")
+                if user_id:
+                    user = db_manager.get_user_by_id(user_id)
+                    if user:
+                        if mark_attendance(user_id):
+                            print("Attendance marked. Exiting application...")
+                            video_capture.release()
+                            cv2.destroyAllWindows()
+                            return
+                    else:
+                        print(f"Error: User with ID '{user_id}' not found.")
+                else:
+                    print("Invalid User ID.")
+                print("\nReturning to face recognition system...")
+    finally:
+    # Release handle to the webcam and close all windows
+        video_capture.release()
+        cv2.destroyAllWindows()
+        
 if __name__ == "__main__":
     run_face_recognition()
-
